@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::{
     buffer::Buffer,
@@ -15,6 +15,10 @@ pub(super) struct AgentRow {
     pub(super) status: crate::api::schema::AgentStatus,
     pub(super) focused: bool,
     pub(super) rows: Vec<Vec<crate::ui::ResolvedToken>>,
+    pub(super) depth: u16,
+    pub(super) has_children: bool,
+    pub(super) expanded: bool,
+    pub(super) rollup: Option<super::agent_tree::Rollup>,
 }
 
 pub(super) fn ordered_agent_pane_ids(
@@ -55,6 +59,7 @@ pub(super) fn render_agent_panel(
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
     agent_scroll: &mut usize,
+    agent_tree_toggled: &mut HashSet<String>,
     hits: &mut ShellHitMap,
 ) {
     if !render_agent_panel_header(
@@ -67,7 +72,20 @@ pub(super) fn render_agent_panel(
         return;
     }
 
-    let rows = agent_rows(snapshot, config, None);
+    // A parent that disappears from the snapshot (e.g. its pane closed) is
+    // pruned from the toggled set on each render so it cannot leak forever.
+    agent_tree_toggled.retain(|pane_id| {
+        snapshot
+            .agents
+            .iter()
+            .any(|agent| &agent.pane_id == pane_id)
+    });
+
+    let rows = if config.agents.tree {
+        agent_tree_rows(snapshot, config, agent_tree_toggled)
+    } else {
+        agent_rows(snapshot, config, None)
+    };
     render_agent_list(
         buffer,
         area,
@@ -82,9 +100,60 @@ pub(super) fn render_agent_panel(
         |row| row.rows.len(),
         |buffer, rect, row, hits| {
             hits.agents.push((rect, row.pane_id.clone()));
+            if row.has_children && rect.width > 0 && rect.height > 0 {
+                hits.agent_toggles
+                    .push((Rect::new(rect.x, rect.y, 1, 1), row.pane_id.clone()));
+            }
             render_agent_row(buffer, rect, row, config);
         },
     );
+}
+
+fn agent_tree_rows(
+    snapshot: &ClientShellSnapshot,
+    config: &ClientShellConfig,
+    toggled: &HashSet<String>,
+) -> Vec<AgentRow> {
+    let root_order = ordered_agent_pane_ids(snapshot, config.agent_panel_sort);
+    // An active agent view (e.g. a review filter) restricts the whole panel
+    // to `agent_order`; the tree must honor that same restriction instead of
+    // letting an out-of-view parent leak back in as a root.
+    let visible: Option<HashSet<&str>> = snapshot
+        .agent_view_label
+        .is_some()
+        .then(|| root_order.iter().map(String::as_str).collect());
+    let tree_agents = snapshot
+        .agents
+        .iter()
+        .filter(|agent| {
+            visible
+                .as_ref()
+                .is_none_or(|visible| visible.contains(agent.pane_id.as_str()))
+        })
+        .map(|agent| super::agent_tree::TreeAgent {
+            pane_id: agent.pane_id.clone(),
+            parent_pane_id: agent.parent_pane_id.clone(),
+            status: agent.agent_status,
+            state_change_seq: agent.state_change_seq,
+        })
+        .collect::<Vec<_>>();
+    let tree_rows = super::agent_tree::build_rows(
+        &tree_agents,
+        &root_order,
+        toggled,
+        config.agents.default_expanded,
+    );
+    tree_rows
+        .into_iter()
+        .filter_map(|tree_row| {
+            let mut row = agent_row(snapshot, &tree_row.pane_id, config, None)?;
+            row.depth = tree_row.depth;
+            row.has_children = tree_row.has_children;
+            row.expanded = tree_row.expanded;
+            row.rollup = tree_row.rollup;
+            Some(row)
+        })
+        .collect()
 }
 
 pub(super) fn render_agent_panel_header(
@@ -315,7 +384,37 @@ pub(super) fn agent_row(
         status: agent.agent_status,
         focused: agent.focused,
         rows,
+        depth: 0,
+        has_children: false,
+        expanded: false,
+        rollup: None,
     })
+}
+
+fn rollup_suffix_text(rollup: &super::agent_tree::Rollup) -> String {
+    use crate::api::schema::AgentStatus;
+    let mut text = format!(" {} agents", rollup.total);
+    for (status, count) in &rollup.counts {
+        if *status == AgentStatus::Idle || *status == AgentStatus::Unknown {
+            continue;
+        }
+        text.push_str(&format!(" \u{b7} {count} {}", sidebar_status_text(*status)));
+    }
+    text
+}
+
+fn truncate_to_display_width(text: &str, max_width: usize) -> String {
+    let mut result = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + width > max_width {
+            break;
+        }
+        used += width;
+        result.push(ch);
+    }
+    result
 }
 
 pub(super) fn render_agent_row(
@@ -341,9 +440,15 @@ pub(super) fn render_agent_row(
     };
     let status_style = Style::default().fg(status_color(row.status, palette));
     let secondary = Style::default().fg(palette.overlay0);
+    // A hidden blocked (or otherwise urgent) descendant must still surface
+    // through the collapsed parent's icon, not the parent's own status.
+    let icon_status = row
+        .rollup
+        .as_ref()
+        .map_or(row.status, |rollup| rollup.most_urgent);
     let icon = (
-        status_icon(row.status, config.status_indicators),
-        Style::default().fg(status_color(row.status, palette)),
+        status_icon(icon_status, config.status_indicators),
+        Style::default().fg(status_color(icon_status, palette)),
     );
     let rows = if row.rows.is_empty() {
         vec![vec![crate::ui::ResolvedToken {
@@ -353,9 +458,35 @@ pub(super) fn render_agent_row(
     } else {
         row.rows.clone()
     };
+    let depth_indent = (2 * row.depth) as usize;
     for (index, tokens) in rows.iter().take(rect.height as usize).enumerate() {
-        let indent = if index == 0 { 1 } else { 3 };
-        let mut spans = vec![ratatui::text::Span::raw(" ".repeat(indent))];
+        let (prefix, indent) = if index == 0 {
+            let arrow = if !row.has_children {
+                " "
+            } else if row.expanded {
+                "\u{25be}"
+            } else {
+                "\u{25b8}"
+            };
+            (
+                format!("{arrow}{}", " ".repeat(depth_indent)),
+                1 + depth_indent,
+            )
+        } else {
+            let indent = 3 + depth_indent;
+            (" ".repeat(indent), indent)
+        };
+        let available = rect.width.saturating_sub(indent as u16) as usize;
+        let suffix = (index == 0)
+            .then_some(row.rollup.as_ref())
+            .flatten()
+            .map(rollup_suffix_text);
+        let suffix_width = suffix.as_ref().map_or(0, |text| {
+            unicode_width::UnicodeWidthStr::width(text.as_str()).min(available)
+        });
+        let suffix = suffix.map(|text| truncate_to_display_width(&text, suffix_width));
+        let content_max_width = available.saturating_sub(suffix_width);
+        let mut spans = vec![ratatui::text::Span::raw(prefix)];
         spans.extend(crate::ui::resolved_token_spans(
             tokens,
             icon,
@@ -364,8 +495,11 @@ pub(super) fn render_agent_row(
             secondary,
             secondary,
             palette,
-            rect.width.saturating_sub(indent as u16) as usize,
+            content_max_width,
         ));
+        if let Some(suffix) = suffix.filter(|suffix| !suffix.is_empty()) {
+            spans.push(ratatui::text::Span::styled(suffix, secondary));
+        }
         Paragraph::new(Line::from(spans)).style(row_style).render(
             Rect::new(rect.x, rect.y + index as u16, rect.width, 1),
             buffer,

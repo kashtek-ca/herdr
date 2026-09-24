@@ -187,6 +187,25 @@ impl App {
         if terminal.is_agent_terminal() || terminal.managed_agent_kind().is_some() {
             return Err(AgentStartError::TargetBusy(params.pane_id));
         }
+        // Rule 6: relaunches never re-parent. Only a pane that has never hosted
+        // an agent adopts a parent here; an explicit `pane.set_parent` retrofits.
+        let first_agent_launch = !terminal.has_hosted_agent();
+        let parent_update = if params.no_parent {
+            None
+        } else if let Some(parent) = params.parent_pane_id.as_deref() {
+            match self.parse_pane_id(parent) {
+                Some((_, parent_pane_id)) if parent_pane_id == pane_id => {
+                    return Err(AgentStartError::ParentIsSelf(params.pane_id));
+                }
+                Some((_, parent_pane_id)) => first_agent_launch.then_some(parent_pane_id),
+                // An auto-captured caller pane may belong to another server or
+                // be stale; fail soft and start without a parent.
+                None if params.parent_auto => None,
+                None => return Err(AgentStartError::ParentNotFound(parent.to_string())),
+            }
+        } else {
+            None
+        };
         let runtime = self
             .terminal_runtimes
             .get(&terminal_id)
@@ -219,11 +238,18 @@ impl App {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));
         }
+        terminal.mark_hosted_agent();
+        if let Some(parent_pane_id) = parent_update {
+            terminal.set_parent_pane_id(Some(parent_pane_id));
+        }
         if let Some(session) = persisted_agent_session {
             terminal.set_managed_agent_launch_session(session);
         }
         self.state.mark_session_dirty();
         self.schedule_session_save();
+        if parent_update.is_some() {
+            self.emit_pane_updated(ws_idx, pane_id);
+        }
 
         let agent = self
             .agent_info(ws_idx, pane_id)
@@ -267,6 +293,14 @@ impl App {
             AgentStartError::InputFailed(message) => crate::api::schema::ErrorBody {
                 code: "agent_start_input_failed".into(),
                 message,
+            },
+            AgentStartError::ParentIsSelf(target) => crate::api::schema::ErrorBody {
+                code: "agent_parent_is_self".into(),
+                message: format!("agent target pane {target} cannot be its own parent"),
+            },
+            AgentStartError::ParentNotFound(parent) => crate::api::schema::ErrorBody {
+                code: "agent_parent_not_found".into(),
+                message: format!("agent parent pane {parent} not found"),
             },
             AgentStartError::DuplicateName { name, candidates } => crate::api::schema::ErrorBody {
                 code: "agent_name_taken".into(),
@@ -454,6 +488,8 @@ pub(super) enum AgentStartError {
     TargetBusy(String),
     TargetUnavailable(String),
     InputFailed(String),
+    ParentIsSelf(String),
+    ParentNotFound(String),
     DuplicateName {
         name: String,
         candidates: Vec<crate::api::schema::AgentInfo>,

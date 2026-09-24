@@ -135,6 +135,17 @@ pub(super) fn snapshot(
             state_labels.sort_by(|left, right| left.0.cmp(&right.0));
             let mut tokens = agent.tokens.into_iter().collect::<Vec<_>>();
             tokens.sort_by(|left, right| left.0.cmp(&right.0));
+            // Rule 4: a parent that no longer exists resolves to `None`.
+            let parent_pane_id = app
+                .parse_pane_id(&pane_id)
+                .and_then(|(workspace_index, pane_id)| {
+                    app.state
+                        .workspaces
+                        .get(workspace_index)?
+                        .terminal_id(pane_id)
+                })
+                .and_then(|terminal_id| app.state.terminals.get(terminal_id))
+                .and_then(|terminal| app.public_parent_pane_id(terminal));
             protocol::ClientShellAgent {
                 pane_id,
                 workspace_id: agent.workspace_id,
@@ -150,6 +161,7 @@ pub(super) fn snapshot(
                 state_labels,
                 tokens,
                 focused,
+                parent_pane_id,
             }
         })
         .collect();
@@ -577,6 +589,59 @@ mod tests {
             )),
             Some(("0.8.3", "### Changed\n- Client shell", true))
         );
+    }
+
+    #[test]
+    fn client_shell_agent_drops_dangling_parent() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let mut workspace = crate::workspace::Workspace::test_new("parents");
+        let parent = workspace.tabs[0].root_pane;
+        let child = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let child_terminal = app.state.workspaces[0].terminal_id(child).cloned().unwrap();
+        let terminal = app.state.terminals.get_mut(&child_terminal).unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Pi),
+            crate::detect::AgentState::Idle,
+        );
+        terminal.set_parent_pane_id(Some(parent));
+        let child_public = app.public_pane_id(0, child).unwrap();
+        let parent_public = app.public_pane_id(0, parent).unwrap();
+        let wire_parent = |app: &crate::app::App| {
+            snapshot(app, "boot", 1, None, None)
+                .agents
+                .into_iter()
+                .find(|agent| agent.pane_id == child_public)
+                .expect("child agent is projected")
+                .parent_pane_id
+        };
+
+        assert_eq!(wire_parent(&app), Some(parent_public));
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_close_parent".into(),
+            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
+                pane_id: app.public_pane_id(0, parent).unwrap(),
+            }),
+        });
+        assert!(!response.contains("\"error\""), "{response}");
+        assert!(app.state.workspaces[0].pane_state(parent).is_none());
+        assert_eq!(
+            app.state.terminals[&child_terminal].parent_pane_id,
+            Some(parent),
+            "the stored id is left alone; only the projection drops it"
+        );
+        assert_eq!(wire_parent(&app), None);
     }
 
     #[test]

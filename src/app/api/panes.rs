@@ -12,9 +12,9 @@ use crate::api::schema::{
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
-    PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult,
-    PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PaneSendTextParams, PaneSetParentParams, PaneSplitParams, PaneSwapParams, PaneSwapReason,
+    PaneSwapResult, PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams,
+    PaneZoomReason, PaneZoomResult, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
@@ -1486,6 +1486,57 @@ impl App {
         encode_success(id, ResponseResult::PaneInfo { pane })
     }
 
+    pub(super) fn handle_pane_set_parent(
+        &mut self,
+        id: String,
+        params: PaneSetParentParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let parent = match params.parent_pane_id.as_deref() {
+            Some(parent) => {
+                let Some((_, parent_pane_id)) = self.parse_pane_id(parent) else {
+                    return encode_error(
+                        id,
+                        "agent_parent_not_found",
+                        format!("parent pane {parent} not found"),
+                    );
+                };
+                if parent_pane_id == pane_id {
+                    return encode_error(
+                        id,
+                        "agent_parent_is_self",
+                        format!("pane {} cannot be its own parent", params.pane_id),
+                    );
+                }
+                Some(parent_pane_id)
+            }
+            None => None,
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.terminal_id(pane_id))
+            .cloned()
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        terminal.set_parent_pane_id(parent);
+        self.state.mark_session_dirty();
+        self.schedule_session_save();
+        self.emit_pane_updated(ws_idx, pane_id);
+        let Some(pane) = self.pane_info(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+
+        encode_success(id, ResponseResult::PaneInfo { pane })
+    }
+
     pub(super) fn handle_pane_read(&mut self, id: String, params: PaneReadParams) -> String {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
@@ -2222,6 +2273,65 @@ mod tests {
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
         (app, public_pane_id)
+    }
+
+    #[test]
+    fn pane_set_parent_overrides_and_clears() {
+        let (mut app, child_public) = app_with_test_workspace();
+        let child = app.state.workspaces[0].tabs[0].root_pane;
+        let first = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let second = app.state.workspaces[0].test_split(ratatui::layout::Direction::Vertical);
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0].terminal_id(child).cloned().unwrap();
+        let first_public = app.public_pane_id(0, first).unwrap();
+        let second_public = app.public_pane_id(0, second).unwrap();
+        let set = |app: &mut App, parent: Option<String>| {
+            let response = app.handle_pane_set_parent(
+                "req".into(),
+                PaneSetParentParams {
+                    pane_id: child_public.clone(),
+                    parent_pane_id: parent,
+                },
+            );
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()
+        };
+
+        let response = set(&mut app, Some(first_public.clone()));
+        assert_eq!(response["result"]["pane"]["parent_pane_id"], first_public);
+        assert_eq!(
+            app.state.terminals[&terminal_id].parent_pane_id,
+            Some(first)
+        );
+
+        // Explicit retrofit ignores rule 6 even once the pane hosted an agent.
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:pi".into(),
+                agent: "pi".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("pi-session").unwrap(),
+            });
+        let response = set(&mut app, Some(second_public.clone()));
+        assert_eq!(response["result"]["pane"]["parent_pane_id"], second_public);
+        assert_eq!(
+            app.state.terminals[&terminal_id].parent_pane_id,
+            Some(second)
+        );
+
+        let response = set(&mut app, Some(child_public.clone()));
+        assert_eq!(response["error"]["code"], "agent_parent_is_self");
+        let response = set(&mut app, Some("w_missing:p9".into()));
+        assert_eq!(response["error"]["code"], "agent_parent_not_found");
+        assert_eq!(
+            app.state.terminals[&terminal_id].parent_pane_id,
+            Some(second)
+        );
+
+        let response = set(&mut app, None);
+        assert!(response["result"]["pane"].get("parent_pane_id").is_none());
+        assert_eq!(app.state.terminals[&terminal_id].parent_pane_id, None);
     }
 
     #[test]

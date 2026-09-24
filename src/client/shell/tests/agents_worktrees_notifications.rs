@@ -1,5 +1,265 @@
 use super::*;
 
+fn tree_agent(
+    pane_id: &str,
+    parent_pane_id: Option<&str>,
+    status: AgentStatus,
+    state_change_seq: u64,
+    focused: bool,
+) -> ClientShellAgent {
+    ClientShellAgent {
+        pane_id: pane_id.into(),
+        workspace_id: "ws_1".into(),
+        tab_id: "tab_1".into(),
+        name: Some(pane_id.into()),
+        display_agent: None,
+        agent: None,
+        title: None,
+        terminal_title: None,
+        terminal_title_stripped: None,
+        agent_status: status,
+        state_change_seq,
+        state_labels: Vec::new(),
+        tokens: Vec::new(),
+        focused,
+        parent_pane_id: parent_pane_id.map(str::to_owned),
+    }
+}
+
+fn parent_with_two_children() -> Vec<ClientShellAgent> {
+    vec![
+        tree_agent("pane_1", None, AgentStatus::Idle, 1, true),
+        tree_agent("pane_2", Some("pane_1"), AgentStatus::Working, 2, false),
+        tree_agent("pane_3", Some("pane_1"), AgentStatus::Blocked, 3, false),
+    ]
+}
+
+#[test]
+fn agent_tree_off_renders_identically_to_the_flat_list() {
+    let mut config = Config::default();
+    config.ui.sidebar.agents.tree = false;
+    let mut projected = snapshot();
+    projected.agents = parent_with_two_children();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    state.compose(106, 30).expect("flat agent sidebar frame");
+
+    assert_eq!(state.hits.agents.len(), 3);
+    assert!(state.hits.agent_toggles.is_empty());
+}
+
+#[test]
+fn collapsed_parent_shows_rollup_and_a_single_toggle_hit() {
+    let mut projected = snapshot();
+    projected.agents = parent_with_two_children();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    let frame = state
+        .compose(106, 30)
+        .expect("collapsed agent sidebar frame");
+    let text = frame_rows(&frame).join("\n");
+
+    assert_eq!(state.hits.agents.len(), 1);
+    assert_eq!(state.hits.agent_toggles.len(), 1);
+    assert!(text.contains('\u{25b8}'), "frame: {text}");
+    assert!(text.contains("2 agents"), "frame: {text}");
+    assert!(text.contains("1 blocked"), "frame: {text}");
+}
+
+#[test]
+fn clicking_the_arrow_expands_without_focusing_the_pane() {
+    let mut projected = snapshot();
+    projected.agents = parent_with_two_children();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    state
+        .compose(106, 30)
+        .expect("collapsed agent sidebar frame");
+    let toggle = state.hits.agent_toggles[0].0;
+
+    let click = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: toggle.x,
+        row: toggle.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    assert!(
+        click.actions.is_empty(),
+        "arrow click must not focus a pane"
+    );
+    assert!(state.agent_tree_toggled.contains("pane_1"));
+
+    state
+        .compose(106, 30)
+        .expect("expanded agent sidebar frame");
+    assert_eq!(state.hits.agents.len(), 3);
+}
+
+#[test]
+fn clicking_the_row_text_focuses_without_toggling() {
+    let mut projected = snapshot();
+    projected.agents = parent_with_two_children();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    state
+        .compose(106, 30)
+        .expect("collapsed agent sidebar frame");
+    let row = state.hits.agents[0].0;
+
+    let click = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: row.x + 3,
+        row: row.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    let [ClientShellAction::Endpoint { request, .. }] = &click.actions[..] else {
+        panic!("row click should focus through the endpoint API");
+    };
+    assert!(matches!(
+        &request.method,
+        crate::api::schema::Method::PaneFocus(target) if target.pane_id == "pane_1"
+    ));
+    assert!(state.agent_tree_toggled.is_empty());
+}
+
+#[test]
+fn default_expanded_shows_every_depth_with_the_open_arrow() {
+    let mut config = Config::default();
+    config.ui.sidebar.agents.default_expanded = true;
+    let mut projected = snapshot();
+    projected.agents = parent_with_two_children();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    let frame = state.compose(106, 30).expect("expanded by default frame");
+
+    assert_eq!(state.hits.agents.len(), 3);
+    let root = state.hits.agents[0].0;
+    assert_eq!(
+        frame_rows(&frame)[root.y as usize]
+            .chars()
+            .nth(root.x as usize),
+        Some('\u{25be}')
+    );
+    let child = state.hits.agents[1].0;
+    let content_start = |rect: Rect| -> usize {
+        frame_rows(&frame)[rect.y as usize]
+            .chars()
+            .skip(rect.x as usize)
+            .position(|ch| ch != ' ')
+            .expect("row has visible content")
+    };
+    assert!(
+        content_start(child) > content_start(root),
+        "child row content should be indented past root's"
+    );
+}
+
+#[test]
+fn collapsed_parent_icon_uses_the_blocked_childs_style() {
+    let mut projected = snapshot();
+    projected.agents = parent_with_two_children();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    let frame = state
+        .compose(106, 30)
+        .expect("collapsed agent sidebar frame");
+    let row = state.hits.agents[0].0;
+    let icon_x = row.x + 1;
+    let icon_index = row.y as usize * frame.width as usize + icon_x as usize;
+    assert_eq!(
+        frame.cells[icon_index].fg,
+        crate::protocol::color_to_u32(state.config.palette.red),
+        "collapsed parent icon should reflect the blocked descendant, not its own idle status"
+    );
+}
+
+#[test]
+fn closed_parent_pane_is_pruned_from_the_toggled_set() {
+    let mut projected = snapshot();
+    projected.agents = parent_with_two_children();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(projected.clone()));
+    state.set_pane_surface(surface());
+    state
+        .compose(106, 30)
+        .expect("collapsed agent sidebar frame");
+    let toggle = state.hits.agent_toggles[0].0;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: toggle.x,
+        row: toggle.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    state
+        .compose(106, 30)
+        .expect("expanded agent sidebar frame");
+    assert!(state.agent_tree_toggled.contains("pane_1"));
+
+    let mut closed = projected.clone();
+    closed.revision = 2;
+    closed.agents.retain(|agent| agent.pane_id != "pane_1");
+    closed.focused_pane_id = Some("pane_2".into());
+    state.set_snapshot(Box::new(closed));
+    let mut closed_surface = surface();
+    closed_surface.projection_revision = 2;
+    state.set_pane_surface(closed_surface);
+    let frame = state.compose(106, 30).expect("pane_1 closed frame");
+
+    assert!(
+        !state.agent_tree_toggled.contains("pane_1"),
+        "closed parent must be pruned from the toggled set"
+    );
+    assert_eq!(state.hits.agents.len(), 2);
+    assert!(state.hits.agent_toggles.is_empty());
+    for (rect, _) in &state.hits.agents {
+        assert_eq!(
+            frame_rows(&frame)[rect.y as usize]
+                .chars()
+                .nth(rect.x as usize),
+            Some(' '),
+            "orphaned children have no children of their own, so no arrow"
+        );
+    }
+}
+
+#[test]
+fn collapsing_after_a_deep_scroll_clamps_without_panicking() {
+    let mut projected = snapshot();
+    let mut agents = vec![tree_agent("pane_1", None, AgentStatus::Idle, 0, true)];
+    for index in 2..=20 {
+        agents.push(tree_agent(
+            &format!("pane_{index}"),
+            Some("pane_1"),
+            AgentStatus::Idle,
+            index,
+            false,
+        ));
+    }
+    projected.agents = agents;
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    state.agent_tree_toggled.insert("pane_1".into());
+    state.compose(106, 12).expect("expanded, tall agent tree");
+    state.agent_scroll = state.hits.agent_max_scroll;
+    state.compose(106, 12).expect("scrolled near the bottom");
+    assert!(state.agent_scroll <= state.hits.agent_max_scroll);
+
+    state.agent_tree_toggled.remove("pane_1");
+    let composed = state.compose(106, 12);
+    assert!(
+        composed.is_some(),
+        "collapse after deep scroll must not panic"
+    );
+    assert!(state.agent_scroll <= state.hits.agent_max_scroll);
+}
+
 #[test]
 fn mouse_hits_use_stable_workspace_tab_and_pane_ids() {
     let config = ClientShellConfig::from_config(&Config::default());
@@ -362,6 +622,7 @@ fn pane_cycle_last_and_agent_actions_resolve_to_stable_pane_ids() {
             state_labels: Vec::new(),
             tokens: Vec::new(),
             focused: true,
+            parent_pane_id: None,
         },
         ClientShellAgent {
             pane_id: "pane_2".into(),
@@ -378,6 +639,7 @@ fn pane_cycle_last_and_agent_actions_resolve_to_stable_pane_ids() {
             state_labels: Vec::new(),
             tokens: Vec::new(),
             focused: false,
+            parent_pane_id: None,
         },
     ];
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
@@ -452,6 +714,7 @@ fn agent_sidebar_honors_priority_symbols_tokens_and_stable_hits() {
             state_labels: Vec::new(),
             tokens: vec![("summary".into(), "review complete".into())],
             focused: true,
+            parent_pane_id: None,
         },
         ClientShellAgent {
             pane_id: "pane_2".into(),
@@ -468,6 +731,7 @@ fn agent_sidebar_honors_priority_symbols_tokens_and_stable_hits() {
             state_labels: vec![("blocked".into(), "needs input".into())],
             tokens: vec![("summary".into(), "waiting for Can".into())],
             focused: false,
+            parent_pane_id: None,
         },
     ];
     let mut config = Config::default();
@@ -591,6 +855,7 @@ fn muted_agent_sidebar_rows_do_not_stack_terminal_faint() {
         state_labels: Vec::new(),
         tokens: Vec::new(),
         focused: true,
+        parent_pane_id: None,
     }];
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(projected));
@@ -658,6 +923,7 @@ fn active_agent_view_controls_sidebar_order_and_focus_indices() {
             state_labels: Vec::new(),
             tokens: Vec::new(),
             focused: true,
+            parent_pane_id: None,
         },
         ClientShellAgent {
             pane_id: "pane_2".into(),
@@ -674,6 +940,7 @@ fn active_agent_view_controls_sidebar_order_and_focus_indices() {
             state_labels: Vec::new(),
             tokens: Vec::new(),
             focused: false,
+            parent_pane_id: None,
         },
         ClientShellAgent {
             pane_id: "pane_3".into(),
@@ -690,6 +957,7 @@ fn active_agent_view_controls_sidebar_order_and_focus_indices() {
             state_labels: Vec::new(),
             tokens: Vec::new(),
             focused: false,
+            parent_pane_id: None,
         },
     ];
     projected.agent_view_label = Some("review".into());
@@ -764,6 +1032,7 @@ fn agent_sort_toggle_is_client_local_and_persists_per_endpoint() {
         state_labels: Vec::new(),
         tokens: Vec::new(),
         focused: true,
+        parent_pane_id: None,
     });
     let config =
         ClientShellConfig::from_config(&Config::default()).with_preferences_path(path.clone());
@@ -1329,6 +1598,7 @@ fn semantic_notifications_use_client_policy_and_stable_navigation_targets() {
         state_labels: Vec::new(),
         tokens: Vec::new(),
         focused: false,
+        parent_pane_id: None,
     });
     state.set_snapshot(Box::new(projected));
     state.set_pane_surface(surface());

@@ -100,6 +100,9 @@ fn agent_start_and_prompt_requests_round_trip() {
             pane_id: "w1:p2".into(),
             args: vec!["--no-session".into()],
             timeout_ms: Some(30_000),
+            parent_pane_id: None,
+            no_parent: false,
+            parent_auto: false,
         }),
     };
     let start_json = serde_json::to_value(&start).unwrap();
@@ -835,6 +838,7 @@ fn worktree_request_and_response_round_trip() {
                 state_labels: HashMap::new(),
                 tokens: HashMap::new(),
                 agent_session: None,
+                parent_pane_id: None,
                 scroll: None,
                 revision: 0,
             },
@@ -1263,6 +1267,7 @@ fn create_response_round_trips_with_root_pane() {
                 state_labels: HashMap::new(),
                 tokens: HashMap::new(),
                 agent_session: None,
+                parent_pane_id: None,
                 scroll: None,
                 revision: 0,
             },

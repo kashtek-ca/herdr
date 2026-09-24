@@ -456,6 +456,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneLinkActivate(_) => "pane.link.activate",
         Method::PaneLinkResolve(_) => "pane.link.resolve",
         Method::PaneRename(_) => "pane.rename",
+        Method::PaneSetParent(_) => "pane.set_parent",
         Method::PaneSendText(_) => "pane.send_text",
         Method::PaneSendKeys(_) => "pane.send_keys",
         Method::PaneSendInput(_) => "pane.send_input",
@@ -1013,6 +1014,7 @@ mod tests {
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
             agent_session: None,
+            parent_pane_id: None,
             scroll: None,
             revision: 0,
         }

@@ -19,6 +19,14 @@ impl ClientShellState {
                 outcome.resize = true;
                 self.persist_chrome_preferences(outcome);
             }
+            crate::input::KeybindMatch::Action(crate::input::KeybindAction::ToggleAgentTree) => {
+                if let Some(target) = self.focused_agent_tree_toggle_target() {
+                    if !self.agent_tree_toggled.remove(&target) {
+                        self.agent_tree_toggled.insert(target);
+                    }
+                    outcome.repaint = true;
+                }
+            }
             crate::input::KeybindMatch::Action(action) => {
                 if self.workspace_preview_action_blocked()
                     && matches!(
@@ -814,6 +822,26 @@ impl ClientShellState {
             Err(_) => true,
         };
         (repaint, Vec::new())
+    }
+
+    /// The pane id whose tree row `ToggleAgentTree` should flip: the focused
+    /// pane's own row when it has children, otherwise its parent's row.
+    pub(super) fn focused_agent_tree_toggle_target(&self) -> Option<String> {
+        let snapshot = self.snapshot.as_deref()?;
+        let focused_pane_id = snapshot.focused_pane_id.as_deref()?;
+        let agent = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.pane_id == focused_pane_id)?;
+        let has_children = snapshot
+            .agents
+            .iter()
+            .any(|other| other.parent_pane_id.as_deref() == Some(focused_pane_id));
+        if has_children {
+            Some(focused_pane_id.to_owned())
+        } else {
+            agent.parent_pane_id.clone()
+        }
     }
 
     pub(super) fn endpoint_method_for_action(

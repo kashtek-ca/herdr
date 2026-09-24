@@ -288,7 +288,7 @@ fn matched_rule_region_preview<'a>(
 
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let Some(name) = args.first() else {
-        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]");
+        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--parent PANE_ID|none] [--timeout MS] [-- <agent-args...>]");
         return Ok(2);
     };
     let separator = args
@@ -298,9 +298,18 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let mut kind = None;
     let mut pane_id = None;
     let mut timeout_ms = None;
+    let mut parent = None;
     let mut index = 1;
     while index < separator {
         match args[index].as_str() {
+            "--parent" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --parent");
+                    return Ok(2);
+                };
+                parent = Some(value.clone());
+                index += 2;
+            }
             "--kind" => {
                 let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
                     eprintln!("missing value for --kind");
@@ -342,6 +351,8 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         eprintln!("missing required --pane");
         return Ok(2);
     };
+    let (parent_pane_id, no_parent, parent_auto) =
+        resolve_agent_start_parent(parent.as_deref(), super::target::caller_pane_id(), &pane_id);
     let Some(expected_kind) = crate::detect::parse_agent_label(&kind) else {
         eprintln!("unsupported interactive agent kind: {kind}");
         return Ok(2);
@@ -377,6 +388,9 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                 pane_id: pane_id.clone(),
                 args: agent_args.clone(),
                 timeout_ms,
+                parent_pane_id: parent_pane_id.clone(),
+                no_parent,
+                parent_auto,
             }),
         })?;
         if response.get("error").is_none() {
@@ -935,7 +949,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent attach <target> [--takeover]");
     eprintln!(
-        "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
+        "  herdr agent start <name> --kind KIND --pane ID [--parent PANE_ID|none] [--timeout MS] [-- <agent-args...>]"
     );
     eprintln!("  herdr agent explain <target> [--json|--format text|json] [--verbose]");
     eprintln!(
@@ -943,6 +957,27 @@ fn print_agent_help() {
     );
     eprintln!("  targets accept unique agent names and pane ids that currently host agents");
     eprintln!("  kinds: {}", super::spec::agent_kind_values().join("|"));
+}
+
+/// Resolve `agent start` parent params. An explicit `--parent` wins; `none`
+/// opts out of auto-capture. Otherwise the caller's own pane (`HERDR_PANE_ID`)
+/// is captured, except when it is the target pane itself.
+fn resolve_agent_start_parent(
+    explicit: Option<&str>,
+    env_pane_id: Option<String>,
+    target_pane_id: &str,
+) -> (Option<String>, bool, bool) {
+    match explicit {
+        Some(value) if value.eq_ignore_ascii_case("none") => (None, true, false),
+        Some(value) => (Some(super::normalize_pane_id(value)), false, false),
+        None => {
+            let captured = env_pane_id
+                .map(|value| super::normalize_pane_id(&value))
+                .filter(|value| value != target_pane_id);
+            let auto = captured.is_some();
+            (captured, false, auto)
+        }
+    }
 }
 
 fn parse_timeout(value: &str) -> Result<u64, i32> {

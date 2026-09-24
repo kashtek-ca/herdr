@@ -4,9 +4,9 @@ use crate::api::schema::{
     PaneMoveDestination, PaneMoveParams, PaneNeighborParams, PaneProcessInfoParams, PaneReadParams,
     PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneRightClickTarget, PaneSendInputParams,
-    PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneTarget,
-    PaneWaitForOutputParams, PaneZoomMode, PaneZoomParams, ReadFormat, ReadSource, Request,
-    SplitDirection,
+    PaneSendKeysParams, PaneSendTextParams, PaneSetParentParams, PaneSplitParams, PaneSwapParams,
+    PaneTarget, PaneWaitForOutputParams, PaneZoomMode, PaneZoomParams, ReadFormat, ReadSource,
+    Request, SplitDirection,
 };
 
 pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
@@ -28,6 +28,7 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
         "zoom" => pane_zoom(&args[1..]),
         "read" => pane_read(&args[1..]),
         "rename" => pane_rename(&args[1..]),
+        "set-parent" => pane_set_parent(&args[1..]),
         "input" => pane_input(&args[1..]),
         "split" => pane_split(&args[1..]),
         "swap" => pane_swap(&args[1..]),
@@ -446,6 +447,23 @@ fn pane_rename(args: &[String]) -> std::io::Result<i32> {
         pane_id: super::normalize_pane_id(raw_pane_id),
         label,
     })
+}
+
+fn pane_set_parent(args: &[String]) -> std::io::Result<i32> {
+    let [raw_pane_id, raw_parent] = args else {
+        eprintln!("usage: herdr pane set-parent <pane_id> <parent_pane_id>|none");
+        return Ok(2);
+    };
+    let parent_pane_id =
+        (!raw_parent.eq_ignore_ascii_case("none")).then(|| super::normalize_pane_id(raw_parent));
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:pane:set_parent".into(),
+        method: Method::PaneSetParent(PaneSetParentParams {
+            pane_id: super::normalize_pane_id(raw_pane_id),
+            parent_pane_id,
+        }),
+    })?)
 }
 
 fn pane_read(args: &[String]) -> std::io::Result<i32> {
@@ -1673,6 +1691,7 @@ fn print_pane_help() {
     );
     eprintln!("  herdr pane zoom [<pane_id>|--pane ID|--current] [--toggle|--on|--off]");
     eprintln!("  herdr pane rename <pane_id> <label>|--clear");
+    eprintln!("  herdr pane set-parent <pane_id> <parent_pane_id>|none");
     eprintln!("  herdr pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr pane input [<pane_id>|--pane ID|--current] --right-click herdr|pane");
     eprintln!(

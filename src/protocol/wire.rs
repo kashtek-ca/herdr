@@ -1089,6 +1089,12 @@ pub struct ClientShellAgent {
     pub state_labels: Vec<(String, String)>,
     pub tokens: Vec<(String, String)>,
     pub focused: bool,
+    /// Public id of the pane whose agent spawned this agent; `None` when unknown
+    /// or when that pane no longer exists.
+    // No `skip_serializing_if`: bincode is positional, so a skipped field
+    // would desynchronize decoding. `default` keeps older JSON readable.
+    #[serde(default)]
+    pub parent_pane_id: Option<String>,
 }
 
 /// Origin-relative geometry for one pane in a rendered pane surface.
@@ -1745,6 +1751,34 @@ mod tests {
     // requires a new named codec; do not update a v1 digest to bless a wire change.
     // They do not detect appended enum variants, so every type reachable from a v1
     // payload is also append-closed.
+
+    #[test]
+    fn client_shell_agent_parent_round_trips_through_bincode() {
+        let agent = |parent_pane_id: Option<&str>| ClientShellAgent {
+            pane_id: "w1:p2".into(),
+            workspace_id: "w1".into(),
+            tab_id: "w1:t1".into(),
+            name: Some("worker".into()),
+            display_agent: None,
+            agent: Some("pi".into()),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_status: crate::api::schema::AgentStatus::Idle,
+            state_change_seq: 3,
+            state_labels: Vec::new(),
+            tokens: vec![("model".into(), "opus".into())],
+            focused: false,
+            parent_pane_id: parent_pane_id.map(str::to_string),
+        };
+        // A trailing field after `parent_pane_id` proves decoding stays aligned.
+        let agents = vec![agent(None), agent(Some("w1:p1")), agent(None)];
+        let encoded = bincode::serde::encode_to_vec(&agents, bincode::config::standard()).unwrap();
+        let (decoded, consumed): (Vec<ClientShellAgent>, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, agents);
+    }
 
     // ---- Round-trip: ClientMessage ----
 

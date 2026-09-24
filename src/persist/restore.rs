@@ -61,6 +61,48 @@ type RestoredTab = (
 );
 type RestoreFailures<T> = (T, usize);
 
+/// Cross-tab/cross-workspace parent links collected during restore. A parent
+/// can live in any tab, so links resolve only after every tab is restored.
+#[derive(Default)]
+struct RestoreParentLinks {
+    /// Old raw pane id (snapshot keyspace) -> restored pane id.
+    new_by_old: HashMap<u32, PaneId>,
+    /// (restored child terminal, old raw parent pane id).
+    pending: Vec<(TerminalId, u32)>,
+}
+
+impl RestoreParentLinks {
+    fn record_tab(
+        &mut self,
+        tab_snap: &TabSnapshot,
+        tab: &crate::workspace::Tab,
+        reverse_id_map: &HashMap<PaneId, u32>,
+    ) {
+        for (new_id, old_id) in reverse_id_map {
+            let Some(pane) = tab.panes.get(new_id) else {
+                continue;
+            };
+            self.new_by_old.insert(*old_id, *new_id);
+            if let Some(old_parent) = tab_snap
+                .panes
+                .get(old_id)
+                .and_then(|saved| saved.parent_pane_id)
+            {
+                self.pending
+                    .push((pane.attached_terminal_id.clone(), old_parent));
+            }
+        }
+    }
+
+    fn apply(self, terminals: &mut HashMap<TerminalId, TerminalState>) {
+        for (terminal_id, old_parent) in self.pending {
+            if let Some(terminal) = terminals.get_mut(&terminal_id) {
+                terminal.set_parent_pane_id(self.new_by_old.get(&old_parent).copied());
+            }
+        }
+    }
+}
+
 /// Restore workspaces from a snapshot. Each pane gets a fresh shell in its saved cwd.
 pub fn restore(
     snapshot: &SessionSnapshot,
@@ -271,6 +313,7 @@ fn restore_with_imports_and_failures(
     let mut terminals = HashMap::new();
     let mut terminal_runtimes = HashMap::new();
     let mut resumed_agent_sessions = HashSet::new();
+    let mut parent_links = RestoreParentLinks::default();
     let mut failed_imports = 0;
     for (idx, ws_snap) in snapshot.workspaces.iter().enumerate() {
         let runtime_context = RestoreRuntimeContext {
@@ -289,6 +332,7 @@ fn restore_with_imports_and_failures(
             &runtime_context,
             &mut resumed_agent_sessions,
             imported_panes,
+            &mut parent_links,
         );
         failed_imports += workspace_failed_imports;
         if let Some((workspace, restored_terminals, restored_runtimes)) = restored {
@@ -299,6 +343,7 @@ fn restore_with_imports_and_failures(
             workspaces.push(workspace);
         }
     }
+    parent_links.apply(&mut terminals);
     crate::workspace::reserve_workspace_ids(&workspaces);
     ((workspaces, terminals, terminal_runtimes), failed_imports)
 }
@@ -311,6 +356,7 @@ fn restore_workspace(
     runtime_context: &RestoreRuntimeContext<'_>,
     resumed_agent_sessions: &mut HashSet<String>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
+    parent_links: &mut RestoreParentLinks,
 ) -> RestoreFailures<Option<RestoredWorkspace>> {
     let mut tabs = Vec::new();
     let mut terminals = Vec::new();
@@ -376,6 +422,7 @@ fn restore_workspace(
             tab.number = public_tab_number;
         }
         next_public_tab_number = next_public_tab_number.max(tab.number + 1);
+        parent_links.record_tab(tab_snap, &tab, &reverse_id_map);
         for pane_id in tab.layout.pane_ids() {
             let public_number = public_pane_numbers_by_old_raw
                 .get(
@@ -497,6 +544,12 @@ fn restore_tab(
             .and_then(crate::detect::parse_canonical_agent_label);
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
+        let saved_hosted_agent = saved_pane.is_some_and(|p| {
+            p.hosted_agent
+                || p.agent_session.is_some()
+                || p.agent_name.is_some()
+                || p.managed_agent_kind.is_some()
+        });
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
         let startup = {
@@ -537,6 +590,9 @@ fn restore_tab(
             let terminal_id = TerminalId::alloc();
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan);
+            if saved_hosted_agent {
+                terminal.mark_hosted_agent();
+            }
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -629,6 +685,9 @@ fn restore_tab(
             Ok(runtime) => {
                 let terminal_id = TerminalId::alloc();
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
+                if saved_hosted_agent {
+                    terminal.mark_hosted_agent();
+                }
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
@@ -1198,6 +1257,8 @@ mod tests {
                                 value: "opencode-session".into(),
                             }),
                             launch_argv: None,
+                            parent_pane_id: None,
+                            hosted_agent: false,
                         },
                     )]),
                     zoomed: false,
@@ -1247,6 +1308,134 @@ mod tests {
         assert_eq!(session.session_ref.value, "opencode-session");
     }
 
+    fn parent_link_pane(
+        cwd: &std::path::Path,
+        parent: Option<u32>,
+    ) -> super::super::snapshot::PaneSnapshot {
+        super::super::snapshot::PaneSnapshot {
+            cwd: cwd.to_path_buf(),
+            label: None,
+            agent_name: None,
+            managed_agent_kind: None,
+            agent_session: None,
+            launch_argv: None,
+            parent_pane_id: parent,
+            hosted_agent: false,
+        }
+    }
+
+    fn parent_link_tab(old_id: u32, parent: Option<u32>) -> TabSnapshot {
+        let cwd = std::env::current_dir().unwrap();
+        TabSnapshot {
+            custom_name: None,
+            layout: LayoutSnapshot::Pane(old_id),
+            panes: HashMap::from([(old_id, parent_link_pane(&cwd, parent))]),
+            zoomed: false,
+            focused: Some(old_id),
+            root_pane: Some(old_id),
+        }
+    }
+
+    fn restore_parent_link_session(tabs: Vec<TabSnapshot>) -> RestoredSession {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd,
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs,
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+        restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+    }
+
+    fn restored_terminal_for_tab<'a>(
+        workspaces: &[Workspace],
+        terminals: &'a HashMap<TerminalId, TerminalState>,
+        tab_idx: usize,
+    ) -> (PaneId, &'a TerminalState) {
+        let tab = &workspaces[0].tabs[tab_idx];
+        let pane_id = tab.root_pane;
+        (
+            pane_id,
+            &terminals[&tab.panes[&pane_id].attached_terminal_id],
+        )
+    }
+
+    #[tokio::test]
+    async fn restore_remaps_parent_across_tabs() {
+        let parent_old = 900_001;
+        let child_old = 900_002;
+        let (workspaces, terminals, runtimes) = restore_parent_link_session(vec![
+            parent_link_tab(parent_old, None),
+            parent_link_tab(child_old, Some(parent_old)),
+        ]);
+
+        assert_eq!(workspaces[0].tabs.len(), 2);
+        let (parent_new, parent_terminal) = restored_terminal_for_tab(&workspaces, &terminals, 0);
+        let (child_new, child_terminal) = restored_terminal_for_tab(&workspaces, &terminals, 1);
+        assert_ne!(parent_new.raw(), parent_old, "restore must remap pane ids");
+        assert_ne!(child_new.raw(), child_old, "restore must remap pane ids");
+        assert_eq!(parent_terminal.parent_pane_id, None);
+        assert_eq!(child_terminal.parent_pane_id, Some(parent_new));
+        for (_, runtime) in runtimes {
+            runtime.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_rehydrates_sticky_hosted_agent_flag() {
+        let mut hosted = parent_link_tab(900_021, None);
+        hosted.panes.get_mut(&900_021).unwrap().hosted_agent = true;
+        let (workspaces, terminals, runtimes) =
+            restore_parent_link_session(vec![hosted, parent_link_tab(900_022, None)]);
+
+        let (_, hosted_terminal) = restored_terminal_for_tab(&workspaces, &terminals, 0);
+        let (_, fresh_terminal) = restored_terminal_for_tab(&workspaces, &terminals, 1);
+        assert!(hosted_terminal.has_hosted_agent_ever);
+        assert!(!fresh_terminal.has_hosted_agent_ever);
+        for (_, runtime) in runtimes {
+            runtime.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_drops_parent_that_did_not_survive() {
+        let (workspaces, terminals, runtimes) =
+            restore_parent_link_session(vec![parent_link_tab(900_011, Some(900_099))]);
+
+        let (_, terminal) = restored_terminal_for_tab(&workspaces, &terminals, 0);
+        assert_eq!(terminal.parent_pane_id, None);
+        for (_, runtime) in runtimes {
+            runtime.shutdown();
+        }
+    }
+
     #[tokio::test]
     async fn restore_preserves_public_id_mapping_after_pane_id_remap() {
         let cwd = std::env::current_dir().unwrap();
@@ -1279,6 +1468,8 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
+                                parent_pane_id: None,
+                                hosted_agent: false,
                             },
                         ),
                         (
@@ -1290,6 +1481,8 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
+                                parent_pane_id: None,
+                                hosted_agent: false,
                             },
                         ),
                     ]),
@@ -1343,6 +1536,8 @@ mod tests {
                     managed_agent_kind: None,
                     agent_session: None,
                     launch_argv: None,
+                    parent_pane_id: None,
+                    hosted_agent: false,
                 },
             )
         };
@@ -1358,6 +1553,8 @@ mod tests {
                 value: "codex-session".into(),
             }),
             launch_argv: None,
+            parent_pane_id: None,
+            hosted_agent: false,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1509,6 +1706,8 @@ mod tests {
                                 value: "codex-session".into(),
                             }),
                             launch_argv: None,
+                            parent_pane_id: None,
+                            hosted_agent: false,
                         },
                     )]),
                     zoomed: false,
@@ -1670,6 +1869,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                parent_pane_id: None,
+                hosted_agent: false,
             },
         );
         let history = SessionHistorySnapshot {

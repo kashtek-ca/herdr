@@ -630,6 +630,7 @@ mod tests {
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
             agent_session: None,
+            parent_pane_id: None,
             scroll,
             revision: 0,
         }

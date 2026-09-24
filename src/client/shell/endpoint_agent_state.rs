@@ -137,6 +137,7 @@ mod tests {
             state_labels: Vec::new(),
             tokens: Vec::new(),
             focused: true,
+            parent_pane_id: None,
         }
     }
 

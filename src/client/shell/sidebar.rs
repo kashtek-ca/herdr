@@ -420,6 +420,7 @@ pub(crate) fn render_sidebar(
         snapshot,
         config,
         state.agent_scroll,
+        state.agent_tree_toggled,
         hits,
     );
 

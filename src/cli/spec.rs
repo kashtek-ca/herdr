@@ -417,6 +417,9 @@ fn agent_command() -> Command {
                         .required(true)
                         .help("Existing pane at an interactive shell prompt"),
                 )
+                .arg(option("parent", "PANE_ID|none").help(
+                    "Pane whose agent is spawning this one (default: the caller's HERDR_PANE_ID; `none` records no parent)",
+                ))
                 .arg(
                     option("timeout", "MS")
                         .help("Wait for interactive readiness (default: 30000; max: 300000)"),
@@ -528,6 +531,12 @@ fn pane_command() -> Command {
                 .arg(required("pane_id", "PANE_ID"))
                 .arg(Arg::new("label").value_name("LABEL").num_args(1..))
                 .arg(flag("clear")),
+        )
+        .subcommand(
+            Command::new("set-parent")
+                .about("Record which pane's agent spawned this pane's agent")
+                .arg(required("pane_id", "PANE_ID"))
+                .arg(required("parent_pane_id", "PARENT_PANE_ID|none")),
         )
         .subcommand(
             Command::new("input")

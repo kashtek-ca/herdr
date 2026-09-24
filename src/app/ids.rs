@@ -37,6 +37,17 @@ impl App {
         ))
     }
 
+    /// Public id of the pane that spawned `terminal`'s agent, or `None` when
+    /// no parent is recorded or the recorded parent pane no longer exists.
+    pub(crate) fn public_parent_pane_id(
+        &self,
+        terminal: &crate::terminal::TerminalState,
+    ) -> Option<String> {
+        let parent = terminal.parent_pane_id?;
+        let (ws_idx, _) = self.find_pane(parent)?;
+        self.public_pane_id(ws_idx, parent)
+    }
+
     pub(super) fn pane_launch_env(
         &self,
         ws_idx: usize,

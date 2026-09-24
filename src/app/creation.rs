@@ -350,6 +350,7 @@ impl App {
             state_labels: presentation.state_labels,
             tokens: terminal.metadata_tokens.values(),
             agent_session: terminal_agent_session_info(terminal),
+            parent_pane_id: self.public_parent_pane_id(terminal),
             scroll,
             revision: terminal.revision,
         })

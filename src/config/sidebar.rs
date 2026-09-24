@@ -427,6 +427,10 @@ pub struct AgentsSidebarConfig {
     #[serde(default, deserialize_with = "deserialize_rows_by_agent")]
     pub rows_by_agent: BTreeMap<String, AgentSidebarRows>,
     pub row_gap: u16,
+    /// Nest agents under the pane that spawned them.
+    pub tree: bool,
+    /// Start orchestrator rows expanded.
+    pub default_expanded: bool,
 }
 
 impl AgentsSidebarConfig {
@@ -451,6 +455,8 @@ impl Default for AgentsSidebarConfig {
             ],
             rows_by_agent: BTreeMap::new(),
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
+            tree: true,
+            default_expanded: false,
         }
     }
 }
@@ -503,6 +509,8 @@ mod tests {
         );
         assert!(config.agents.rows_by_agent.is_empty());
         assert_eq!(config.agents.row_gap, 0);
+        assert!(config.agents.tree);
+        assert!(!config.agents.default_expanded);
         assert_eq!(
             config.spaces.rows,
             vec![

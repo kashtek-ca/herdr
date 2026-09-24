@@ -107,6 +107,14 @@ pub struct PaneSnapshot {
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    /// Raw id (same keyspace as `TabSnapshot::panes` keys) of the pane whose
+    /// agent spawned this pane's agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_pane_id: Option<u32>,
+    /// Sticky "this pane has hosted an agent" fact, so a restart without an
+    /// agent session still refuses to re-parent a relaunch (rule 6).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hosted_agent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,6 +343,10 @@ fn capture_tab(
             })
             .unwrap_or_default();
         let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
+        let parent_pane_id = terminal
+            .and_then(|terminal| terminal.parent_pane_id)
+            .map(|parent| parent.raw());
+        let hosted_agent = terminal.is_some_and(|terminal| terminal.has_hosted_agent_ever);
         let agent_session = terminal.and_then(|terminal| {
             if let Some(authority) = terminal.hook_authority.as_ref() {
                 if let Some(session_ref) = authority.session_ref.as_ref() {
@@ -365,6 +377,8 @@ fn capture_tab(
                 managed_agent_kind,
                 agent_session,
                 launch_argv,
+                parent_pane_id,
+                hosted_agent,
             },
         );
     }
@@ -489,6 +503,39 @@ mod tests {
     use crate::layout::NavDirection;
     use crate::workspace::Workspace;
 
+    #[test]
+    fn pane_snapshot_without_parent_field_deserializes() {
+        let old: PaneSnapshot =
+            serde_json::from_str(r#"{"cwd":"/tmp","label":"reviewer","agent_name":"reviewer"}"#)
+                .unwrap();
+        assert_eq!(old.parent_pane_id, None);
+        assert_eq!(old.label.as_deref(), Some("reviewer"));
+        let reencoded = serde_json::to_value(&old).unwrap();
+        assert!(reencoded.get("parent_pane_id").is_none());
+
+        let linked: PaneSnapshot =
+            serde_json::from_str(r#"{"cwd":"/tmp","parent_pane_id":7}"#).unwrap();
+        assert_eq!(linked.parent_pane_id, Some(7));
+    }
+
+    #[test]
+    fn pane_snapshot_hosted_agent_round_trips() {
+        let old: PaneSnapshot = serde_json::from_str(r#"{"cwd":"/tmp"}"#).unwrap();
+        assert!(!old.hosted_agent);
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("hosted_agent")
+            .is_none());
+
+        let hosted: PaneSnapshot =
+            serde_json::from_str(r#"{"cwd":"/tmp","hosted_agent":true}"#).unwrap();
+        assert!(hosted.hosted_agent);
+        let json = serde_json::to_value(&hosted).unwrap();
+        assert_eq!(json["hosted_agent"], true);
+        let back: PaneSnapshot = serde_json::from_value(json).unwrap();
+        assert!(back.hosted_agent);
+    }
+
     fn session_fixture(name: &str) -> &'static str {
         match name {
             "current-herdr" => {
@@ -554,6 +601,33 @@ mod tests {
             LayoutSnapshot::Split { ratio, .. } => Some(*ratio),
             LayoutSnapshot::Pane(_) => None,
         }
+    }
+
+    #[test]
+    fn capture_persists_sticky_hosted_agent_flag() {
+        let mut state = state_with_workspaces(&["hosted-snapshot"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let fresh = capture_from_state(&state);
+        assert!(!fresh.workspaces[0].tabs[0].panes[&root.raw()].hosted_agent);
+
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .mark_hosted_agent();
+        let hosted = capture_from_state(&state);
+        let pane = &hosted.workspaces[0].tabs[0].panes[&root.raw()];
+        assert!(pane.hosted_agent);
+        assert_eq!(
+            pane.agent_session, None,
+            "the flag survives without a session"
+        );
+        let json = serde_json::to_string(&hosted).unwrap();
+        let back: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(back.workspaces[0].tabs[0].panes[&root.raw()].hosted_agent);
     }
 
     #[test]
@@ -646,6 +720,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                parent_pane_id: None,
+                hosted_agent: false,
             },
         );
         panes.insert(
@@ -657,6 +733,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                parent_pane_id: None,
+                hosted_agent: false,
             },
         );
 
@@ -1210,6 +1288,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                parent_pane_id: None,
+                hosted_agent: false,
             },
         );
         panes.insert(
@@ -1223,6 +1303,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                parent_pane_id: None,
+                hosted_agent: false,
             },
         );
 

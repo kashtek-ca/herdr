@@ -2095,6 +2095,19 @@ impl ClientShellState {
                 if self.handle_endpoint_agent_click(point, outcome) {
                     return;
                 }
+                let agent_toggle_pane_id = self
+                    .hits
+                    .agent_toggles
+                    .iter()
+                    .find(|(rect, _)| super::contains(*rect, point))
+                    .map(|(_, pane_id)| pane_id.clone());
+                if let Some(pane_id) = agent_toggle_pane_id {
+                    if !self.agent_tree_toggled.remove(&pane_id) {
+                        self.agent_tree_toggled.insert(pane_id);
+                    }
+                    outcome.repaint = true;
+                    return;
+                }
                 let agent_pane_id = self
                     .hits
                     .agents

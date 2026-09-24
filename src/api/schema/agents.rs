@@ -173,6 +173,17 @@ pub struct AgentStartParams {
     /// Startup timeout in milliseconds. Values must be greater than 3000 and at most 300000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Pane whose agent is spawning this one. `None` = auto-capture from caller env on the CLI side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_pane_id: Option<String>,
+    /// True when the caller explicitly asked for no parent (`--parent none`). Overrides auto-capture.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_parent: bool,
+    /// True when `parent_pane_id` was auto-captured from the caller's
+    /// `HERDR_PANE_ID` rather than passed explicitly. An auto-captured parent
+    /// that does not resolve is dropped instead of failing the start.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parent_auto: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

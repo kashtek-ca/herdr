@@ -130,6 +130,11 @@ pub struct TerminalState {
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
+    /// Pane whose agent spawned this pane's agent. See devops plan "agent sidebar tiers".
+    pub parent_pane_id: Option<crate::layout::PaneId>,
+    /// Sticky: set once this terminal hosted a herdr-started or restored agent.
+    /// Never cleared on agent exit, so relaunches keep their parent (rule 6).
+    pub has_hosted_agent_ever: bool,
     pub agent_name: Option<String>,
     agent_name_owner: Option<AgentNameOwner>,
     managed_agent: Option<ManagedAgent>,
@@ -165,6 +170,8 @@ impl TerminalState {
             persisted_agent_session: None,
             terminal_title: None,
             manual_label: None,
+            parent_pane_id: None,
+            has_hosted_agent_ever: false,
             agent_name: None,
             agent_name_owner: None,
             managed_agent: None,
@@ -1885,6 +1892,23 @@ impl TerminalState {
 
     pub fn clear_manual_label(&mut self) {
         self.manual_label = None;
+    }
+
+    pub fn set_parent_pane_id(&mut self, parent: Option<crate::layout::PaneId>) {
+        self.parent_pane_id = parent;
+    }
+
+    pub fn mark_hosted_agent(&mut self) {
+        self.has_hosted_agent_ever = true;
+    }
+
+    /// True when this terminal has hosted an agent: the sticky flag, or any
+    /// agent identity still present (e.g. a manually launched agent's session).
+    pub fn has_hosted_agent(&self) -> bool {
+        self.has_hosted_agent_ever
+            || self.persisted_agent_session.is_some()
+            || self.agent_name.is_some()
+            || self.managed_agent_kind().is_some()
     }
 
     pub fn set_agent_name(&mut self, name: String) {

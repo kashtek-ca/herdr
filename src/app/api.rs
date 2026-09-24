@@ -1125,6 +1125,9 @@ impl App {
                 return self.handle_pane_link_activate(request.id, params);
             }
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
+            Method::PaneSetParent(params) => {
+                return self.handle_pane_set_parent(request.id, params);
+            }
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
             Method::PaneGraphicsSet(params) => {
                 return self.handle_pane_graphics_set(request.id, params);

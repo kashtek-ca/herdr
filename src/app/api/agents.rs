@@ -820,4 +820,229 @@ mod tests {
             );
         }
     }
+
+    struct ParentFixture {
+        app: App,
+        child: crate::layout::PaneId,
+        parent: crate::layout::PaneId,
+        other: crate::layout::PaneId,
+        child_terminal: crate::terminal::TerminalId,
+        _input: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    }
+
+    fn parent_fixture() -> ParentFixture {
+        let mut app = app_with_agent();
+        let parent = app.state.workspaces[0].tabs[0].root_pane;
+        let child = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let other = app.state.workspaces[0].test_split(ratatui::layout::Direction::Vertical);
+        app.state.ensure_test_terminals();
+        let child_terminal = app.state.workspaces[0].terminal_id(child).cloned().unwrap();
+        let (runtime, input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes
+            .insert(child_terminal.clone(), runtime);
+        ParentFixture {
+            app,
+            child,
+            parent,
+            other,
+            child_terminal,
+            _input: input,
+        }
+    }
+
+    fn start_params(pane_id: String, parent_pane_id: Option<String>) -> AgentStartParams {
+        AgentStartParams {
+            name: "worker".into(),
+            kind: "pi".into(),
+            pane_id,
+            args: Vec::new(),
+            timeout_ms: Some(4_000),
+            parent_pane_id,
+            no_parent: false,
+            parent_auto: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_start_captures_parent_on_first_launch() {
+        let mut fx = parent_fixture();
+        let child = fx.app.public_pane_id(0, fx.child).unwrap();
+        let parent = fx.app.public_pane_id(0, fx.parent).unwrap();
+
+        let response = fx
+            .app
+            .handle_agent_start("req".into(), start_params(child, Some(parent.clone())));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["result"]["type"], "agent_started", "{response}");
+        assert_eq!(
+            fx.app.state.terminals[&fx.child_terminal].parent_pane_id,
+            Some(fx.parent)
+        );
+        let pane = fx.app.pane_info(0, fx.child).unwrap();
+        assert_eq!(pane.parent_pane_id.as_deref(), Some(parent.as_str()));
+    }
+
+    #[tokio::test]
+    async fn agent_start_keeps_existing_parent_on_relaunch() {
+        let mut fx = parent_fixture();
+        let terminal = fx.app.state.terminals.get_mut(&fx.child_terminal).unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("pi-session").unwrap(),
+        });
+        terminal.set_parent_pane_id(Some(fx.parent));
+        let child = fx.app.public_pane_id(0, fx.child).unwrap();
+        let other = fx.app.public_pane_id(0, fx.other).unwrap();
+
+        let response = fx
+            .app
+            .handle_agent_start("req".into(), start_params(child, Some(other)));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["result"]["type"], "agent_started", "{response}");
+        assert_eq!(
+            fx.app.state.terminals[&fx.child_terminal].parent_pane_id,
+            Some(fx.parent)
+        );
+    }
+
+    fn drive_agent_exit(app: &mut App, pane_id: crate::layout::PaneId) {
+        use crate::events::AppEvent;
+        let now = std::time::Instant::now;
+        app.handle_internal_event(AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: Agent::Pi,
+            observed_at: now(),
+        });
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: now(),
+        });
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: now(),
+        });
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id,
+            agent: None,
+            state: AgentState::Unknown,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: now(),
+        });
+    }
+
+    #[tokio::test]
+    async fn agent_start_keeps_parent_after_agent_exit_and_relaunch() {
+        let mut fx = parent_fixture();
+        let child = fx.app.public_pane_id(0, fx.child).unwrap();
+        let parent = fx.app.public_pane_id(0, fx.parent).unwrap();
+        let other = fx.app.public_pane_id(0, fx.other).unwrap();
+
+        let first = fx
+            .app
+            .handle_agent_start("req".into(), start_params(child.clone(), Some(parent)));
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(first["result"]["type"], "agent_started", "{first}");
+        assert_eq!(
+            fx.app.state.terminals[&fx.child_terminal].parent_pane_id,
+            Some(fx.parent)
+        );
+
+        drive_agent_exit(&mut fx.app, fx.child);
+        let terminal = &fx.app.state.terminals[&fx.child_terminal];
+        assert_eq!(terminal.agent_name, None, "exit frees the agent name");
+        assert_eq!(
+            terminal.managed_agent_kind(),
+            None,
+            "exit clears the managed agent"
+        );
+        assert!(terminal.persisted_agent_session.is_none());
+        assert!(terminal.has_hosted_agent_ever, "the hosted flag is sticky");
+
+        let mut relaunch = start_params(child, Some(other));
+        relaunch.parent_auto = true;
+        let second = fx.app.handle_agent_start("req".into(), relaunch);
+        let second: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(second["result"]["type"], "agent_started", "{second}");
+        assert_eq!(
+            fx.app.state.terminals[&fx.child_terminal].parent_pane_id,
+            Some(fx.parent),
+            "rule 6: a relaunch never re-parents"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_start_no_parent_flag_skips_capture() {
+        let mut fx = parent_fixture();
+        let child = fx.app.public_pane_id(0, fx.child).unwrap();
+        let parent = fx.app.public_pane_id(0, fx.parent).unwrap();
+        let mut params = start_params(child, Some(parent));
+        params.no_parent = true;
+
+        let response = fx.app.handle_agent_start("req".into(), params);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["result"]["type"], "agent_started", "{response}");
+        assert_eq!(
+            fx.app.state.terminals[&fx.child_terminal].parent_pane_id,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_start_auto_parent_not_found_starts_without_parent() {
+        let mut fx = parent_fixture();
+        let child = fx.app.public_pane_id(0, fx.child).unwrap();
+        let mut params = start_params(child, Some("w_missing:p9".into()));
+        params.parent_auto = true;
+
+        let response = fx.app.handle_agent_start("req".into(), params);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["result"]["type"], "agent_started", "{response}");
+        assert_eq!(
+            fx.app.state.terminals[&fx.child_terminal].parent_pane_id,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_start_rejects_self_parent() {
+        let mut fx = parent_fixture();
+        let child = fx.app.public_pane_id(0, fx.child).unwrap();
+
+        let response = fx
+            .app
+            .handle_agent_start("req".into(), start_params(child.clone(), Some(child)));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["error"]["code"], "agent_parent_is_self");
+        let terminal = &fx.app.state.terminals[&fx.child_terminal];
+        assert_eq!(terminal.parent_pane_id, None);
+        assert_eq!(terminal.agent_name, None);
+
+        let missing = fx.app.handle_agent_start(
+            "req".into(),
+            start_params(
+                fx.app.public_pane_id(0, fx.child).unwrap(),
+                Some("w_missing:p9".into()),
+            ),
+        );
+        let missing: serde_json::Value = serde_json::from_str(&missing).unwrap();
+        assert_eq!(missing["error"]["code"], "agent_parent_not_found");
+    }
 }

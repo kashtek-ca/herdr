@@ -193,6 +193,7 @@ fn pane_scroll_result(
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
             agent_session: None,
+            parent_pane_id: None,
             scroll: Some(crate::api::schema::PaneScrollInfo {
                 offset_from_bottom,
                 max_offset_from_bottom,

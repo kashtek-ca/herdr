@@ -808,6 +808,13 @@
             "pane_id": {
               "type": "string"
             },
+            "parent_pane_id": {
+              "description": "Public id of the pane whose agent spawned this pane's agent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "revision": {
               "format": "uint64",
               "minimum": 0,
@@ -1346,8 +1353,23 @@
             "name": {
               "type": "string"
             },
+            "no_parent": {
+              "description": "True when the caller explicitly asked for no parent (`--parent none`). Overrides auto-capture.",
+              "type": "boolean"
+            },
             "pane_id": {
               "type": "string"
+            },
+            "parent_auto": {
+              "description": "True when `parent_pane_id` was auto-captured from the caller's\n`HERDR_PANE_ID` rather than passed explicitly. An auto-captured parent\nthat does not resolve is dropped instead of failing the start.",
+              "type": "boolean"
+            },
+            "parent_pane_id": {
+              "description": "Pane whose agent is spawning this one. `None` = auto-capture from caller env on the CLI side.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "timeout_ms": {
               "description": "Startup timeout in milliseconds. Values must be greater than 3000 and at most 300000.",
@@ -3287,6 +3309,24 @@
           "required": [
             "pane_id",
             "text"
+          ],
+          "type": "object"
+        },
+        "PaneSetParentParams": {
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            },
+            "parent_pane_id": {
+              "description": "`None` clears the parent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "pane_id"
           ],
           "type": "object"
         },
@@ -5902,6 +5942,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.set_parent",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSetParentParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.send_text",
               "type": "string"
             },
@@ -7988,6 +8044,13 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "parent_pane_id": {
+              "description": "Public id of the pane whose agent spawned this pane's agent.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "revision": {
               "format": "uint64",
