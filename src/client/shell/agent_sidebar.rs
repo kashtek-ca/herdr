@@ -19,6 +19,13 @@ pub(super) struct AgentRow {
     pub(super) has_children: bool,
     pub(super) expanded: bool,
     pub(super) rollup: Option<super::agent_tree::Rollup>,
+    /// Same data as `rollup` but populated whether the row is expanded or
+    /// collapsed; used to compute the `CD-` coordinator live-count suffix,
+    /// which must show while expanded too.
+    pub(super) descendant_rollup: Option<super::agent_tree::Rollup>,
+    /// The agent's resolved display label (same value rendered via the
+    /// `agent` token), used to detect `CD-` coordinator rows.
+    pub(super) label: Option<String>,
 }
 
 pub(super) fn ordered_agent_pane_ids(
@@ -101,8 +108,15 @@ pub(super) fn render_agent_panel(
         |buffer, rect, row, hits| {
             hits.agents.push((rect, row.pane_id.clone()));
             if row.has_children && rect.width > 0 && rect.height > 0 {
-                hits.agent_toggles
-                    .push((Rect::new(rect.x, rect.y, 1, 1), row.pane_id.clone()));
+                // The arrow sits after the depth indent on line 0 (see
+                // `render_agent_row`), so the toggle hit-rect must follow it
+                // there too, clamped to stay inside the row.
+                let arrow_offset =
+                    (2u16.saturating_mul(row.depth)).min(rect.width.saturating_sub(1));
+                hits.agent_toggles.push((
+                    Rect::new(rect.x + arrow_offset, rect.y, 1, 1),
+                    row.pane_id.clone(),
+                ));
             }
             render_agent_row(buffer, rect, row, config);
         },
@@ -151,6 +165,7 @@ fn agent_tree_rows(
             row.has_children = tree_row.has_children;
             row.expanded = tree_row.expanded;
             row.rollup = tree_row.rollup;
+            row.descendant_rollup = tree_row.descendant_rollup;
             Some(row)
         })
         .collect()
@@ -388,7 +403,31 @@ pub(super) fn agent_row(
         has_children: false,
         expanded: false,
         rollup: None,
+        descendant_rollup: None,
+        label: agent_label.map(str::to_string),
     })
+}
+
+/// `CD-` coordinator rows (e.g. `CD-S5-Cartographer`) show a live `-W/T`
+/// count of Working-vs-total descendants instead of the default rollup
+/// suffix, whether the row is expanded or collapsed.
+fn cd_coordinator_suffix(row: &AgentRow) -> Option<String> {
+    use crate::api::schema::AgentStatus;
+    if !row.has_children {
+        return None;
+    }
+    let label = row.label.as_deref()?;
+    if !label.starts_with("CD-") {
+        return None;
+    }
+    let rollup = row.descendant_rollup.as_ref()?;
+    let working = rollup
+        .counts
+        .iter()
+        .find(|(status, _)| *status == AgentStatus::Working)
+        .map(|(_, count)| *count)
+        .unwrap_or(0);
+    Some(format!("-{working}/{}", rollup.total))
 }
 
 fn rollup_suffix_text(rollup: &super::agent_tree::Rollup) -> String {
@@ -459,6 +498,20 @@ pub(super) fn render_agent_row(
         row.rows.clone()
     };
     let depth_indent = (2 * row.depth) as usize;
+    // The `CD-` live-count suffix reads best stuck to the name itself. The
+    // name is whichever configured row renders the `agent` token (by default
+    // row 1, under the workspace/tab line); fall back to row 0 — the same
+    // slot the default rollup suffix uses — if no row carries that token.
+    let cd_suffix = cd_coordinator_suffix(row);
+    let cd_suffix_line = cd_suffix.as_ref().and_then(|_| {
+        rows.iter()
+            .position(|tokens| {
+                tokens
+                    .iter()
+                    .any(|token| matches!(token.kind, crate::ui::ResolvedTokenKind::Agent(_)))
+            })
+            .or(Some(0))
+    });
     for (index, tokens) in rows.iter().take(rect.height as usize).enumerate() {
         let (prefix, indent) = if index == 0 {
             let arrow = if !row.has_children {
@@ -469,7 +522,7 @@ pub(super) fn render_agent_row(
                 "\u{25b8}"
             };
             (
-                format!("{arrow}{}", " ".repeat(depth_indent)),
+                format!("{}{arrow}", " ".repeat(depth_indent)),
                 1 + depth_indent,
             )
         } else {
@@ -477,10 +530,11 @@ pub(super) fn render_agent_row(
             (" ".repeat(indent), indent)
         };
         let available = rect.width.saturating_sub(indent as u16) as usize;
-        let suffix = (index == 0)
-            .then_some(row.rollup.as_ref())
-            .flatten()
-            .map(rollup_suffix_text);
+        let suffix = if let Some(cd_text) = cd_suffix.as_ref() {
+            (cd_suffix_line == Some(index)).then(|| cd_text.clone())
+        } else {
+            (index == 0).then_some(row.rollup.as_ref()).flatten().map(rollup_suffix_text)
+        };
         let suffix_width = suffix.as_ref().map_or(0, |text| {
             unicode_width::UnicodeWidthStr::width(text.as_str()).min(available)
         });

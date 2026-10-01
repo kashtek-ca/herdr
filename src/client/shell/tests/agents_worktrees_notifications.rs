@@ -34,6 +34,18 @@ fn parent_with_two_children() -> Vec<ClientShellAgent> {
     ]
 }
 
+fn named_tree_agent(
+    pane_id: &str,
+    name: &str,
+    parent_pane_id: Option<&str>,
+    status: AgentStatus,
+    state_change_seq: u64,
+) -> ClientShellAgent {
+    let mut agent = tree_agent(pane_id, parent_pane_id, status, state_change_seq, false);
+    agent.name = Some(name.into());
+    agent
+}
+
 #[test]
 fn agent_tree_off_renders_identically_to_the_flat_list() {
     let mut config = Config::default();
@@ -1731,4 +1743,179 @@ fn semantic_notifications_use_client_policy_and_stable_navigation_targets() {
     assert!(repaint);
     assert!(state.visible_notification.is_none());
     assert_eq!(state.pending_notifications.len(), 1);
+}
+
+fn three_level_chain() -> Vec<ClientShellAgent> {
+    vec![
+        tree_agent("root", None, AgentStatus::Idle, 0, true),
+        tree_agent("mid", Some("root"), AgentStatus::Idle, 1, false),
+        tree_agent("leaf", Some("mid"), AgentStatus::Idle, 2, false),
+        tree_agent("leafleaf", Some("leaf"), AgentStatus::Idle, 3, false),
+    ]
+}
+
+#[test]
+fn arrow_column_follows_depth_indent_at_every_level() {
+    let mut config = Config::default();
+    config.ui.sidebar.agents.default_expanded = true;
+    let mut projected = snapshot();
+    projected.agents = three_level_chain();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    let frame = state.compose(106, 30).expect("fully expanded frame");
+
+    assert_eq!(state.hits.agents.len(), 4);
+    assert_eq!(state.hits.agent_toggles.len(), 3, "root, mid, leaf all have children");
+
+    let rows = frame_rows(&frame);
+    let expected_depth_indent = [("root", 0u16), ("mid", 1), ("leaf", 2)];
+    for (pane_id, depth) in expected_depth_indent {
+        let row_rect = state
+            .hits
+            .agents
+            .iter()
+            .find(|(_, id)| id == pane_id)
+            .map(|(rect, _)| *rect)
+            .unwrap_or_else(|| panic!("no agent row hit-rect for {pane_id}"));
+        let expected_offset = 2 * depth;
+        assert_eq!(
+            rows[row_rect.y as usize]
+                .chars()
+                .nth((row_rect.x + expected_offset) as usize),
+            Some('\u{25be}'),
+            "{pane_id} arrow should sit {expected_offset} cols after the row start"
+        );
+
+        let toggle_rect = state
+            .hits
+            .agent_toggles
+            .iter()
+            .find(|(_, id)| id == pane_id)
+            .map(|(rect, _)| *rect)
+            .unwrap_or_else(|| panic!("no toggle hit-rect for {pane_id}"));
+        assert_eq!(
+            toggle_rect.x,
+            row_rect.x + expected_offset,
+            "{pane_id} toggle hit-rect must sit on the arrow, not column 0"
+        );
+    }
+}
+
+#[test]
+fn clicking_nested_parent_arrow_toggles_it() {
+    let mut config = Config::default();
+    config.ui.sidebar.agents.default_expanded = true;
+    let mut projected = snapshot();
+    projected.agents = three_level_chain();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    state.compose(106, 30).expect("fully expanded frame");
+
+    let mid_toggle = state
+        .hits
+        .agent_toggles
+        .iter()
+        .find(|(_, id)| id == "mid")
+        .map(|(rect, _)| *rect)
+        .expect("mid toggle hit-rect");
+
+    let click = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: mid_toggle.x,
+        row: mid_toggle.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    assert!(click.actions.is_empty(), "arrow click must not focus a pane");
+    assert!(state.agent_tree_toggled.contains("mid"));
+
+    state.compose(106, 30).expect("mid collapsed frame");
+    assert_eq!(
+        state.hits.agents.len(),
+        2,
+        "collapsing mid hides leaf and leafleaf, leaving only root and mid"
+    );
+}
+
+fn cd_coordinator_with_children() -> Vec<ClientShellAgent> {
+    vec![
+        named_tree_agent("pane_1", "CD-S5-Cartographer", None, AgentStatus::Idle, 0),
+        named_tree_agent(
+            "pane_2",
+            "pane_2",
+            Some("pane_1"),
+            AgentStatus::Working,
+            1,
+        ),
+        named_tree_agent(
+            "pane_3",
+            "pane_3",
+            Some("pane_1"),
+            AgentStatus::Working,
+            2,
+        ),
+        named_tree_agent("pane_4", "pane_4", Some("pane_1"), AgentStatus::Idle, 3),
+        named_tree_agent("pane_5", "pane_5", Some("pane_1"), AgentStatus::Blocked, 4),
+    ]
+}
+
+#[test]
+fn cd_prefixed_parent_shows_live_working_over_total_suffix_collapsed() {
+    let mut projected = snapshot();
+    projected.agents = cd_coordinator_with_children();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    let frame = state
+        .compose(106, 30)
+        .expect("collapsed CD coordinator frame");
+    let text = frame_rows(&frame).join("\n");
+
+    assert!(
+        text.contains("CD-S5-Cartographer-2/4"),
+        "frame: {text}"
+    );
+    assert!(
+        !text.contains("4 agents"),
+        "CD- suffix replaces the default rollup text: {text}"
+    );
+}
+
+#[test]
+fn cd_prefixed_parent_shows_live_working_over_total_suffix_expanded() {
+    let mut config = Config::default();
+    config.ui.sidebar.agents.default_expanded = true;
+    let mut projected = snapshot();
+    projected.agents = cd_coordinator_with_children();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    let frame = state
+        .compose(106, 30)
+        .expect("expanded CD coordinator frame");
+    let text = frame_rows(&frame).join("\n");
+
+    assert_eq!(state.hits.agents.len(), 5, "all descendants visible");
+    assert!(
+        text.contains("CD-S5-Cartographer-2/4"),
+        "the -W/T suffix must show while expanded too: {text}"
+    );
+}
+
+#[test]
+fn non_cd_parent_keeps_the_default_rollup_suffix() {
+    let mut projected = snapshot();
+    projected.agents = parent_with_two_children();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    let frame = state
+        .compose(106, 30)
+        .expect("collapsed non-CD parent frame");
+    let text = frame_rows(&frame).join("\n");
+
+    assert!(text.contains("2 agents"), "frame: {text}");
+    assert!(text.contains("1 blocked"), "frame: {text}");
+    assert!(!text.contains("-2/2"), "non-CD rows must not get the -W/T suffix: {text}");
 }

@@ -25,6 +25,13 @@ pub(super) struct TreeRow {
     pub(super) has_children: bool,
     pub(super) expanded: bool,         // meaningful only when has_children
     pub(super) rollup: Option<Rollup>, // Some only when has_children && !expanded
+    /// Same rollup data as `rollup`, but populated whenever `has_children` is
+    /// true regardless of expand/collapse state. Collapsed-only `rollup`
+    /// exists to drive the default "N agents · k working" suffix, which only
+    /// makes sense when the children are hidden; this field exists for
+    /// callers (e.g. the `CD-` coordinator live-count suffix) that need the
+    /// descendant totals even while the row is expanded.
+    pub(super) descendant_rollup: Option<Rollup>,
 }
 
 /// Summary of a collapsed subtree (ALL descendants, not just direct children).
@@ -197,10 +204,15 @@ fn push_subtree(
     let children = children_of.get(pane_id).unwrap_or(&no_children);
     let has_children = !children.is_empty();
     let expanded = has_children && is_expanded(pane_id, toggled, default_expanded);
-    let rollup = if has_children && !expanded {
+    let descendant_rollup = if has_children {
         Some(build_rollup(children, agents, index_of, children_of))
     } else {
         None
+    };
+    let rollup = if expanded {
+        None
+    } else {
+        descendant_rollup.clone()
     };
     rows.push(TreeRow {
         pane_id: pane_id.to_string(),
@@ -208,6 +220,7 @@ fn push_subtree(
         has_children,
         expanded,
         rollup,
+        descendant_rollup,
     });
     if expanded {
         for child in children {
@@ -387,6 +400,49 @@ mod tests {
         let root_order = ids(&["b", "a"]);
         let rows = build_rows(&agents, &root_order, &HashSet::new(), false);
         assert_eq!(row_ids(&rows), vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn descendant_rollup_is_populated_whether_expanded_or_collapsed() {
+        let agents = vec![
+            agent("p", None, AgentStatus::Idle, 0),
+            agent("c1", Some("p"), AgentStatus::Working, 1),
+            agent("c2", Some("p"), AgentStatus::Working, 2),
+            agent("c3", Some("p"), AgentStatus::Idle, 3),
+            agent("c4", Some("p"), AgentStatus::Blocked, 4),
+        ];
+        let root_order = ids(&["p"]);
+
+        let collapsed = build_rows(&agents, &root_order, &HashSet::new(), false);
+        assert!(!collapsed[0].expanded);
+        assert!(collapsed[0].rollup.is_some(), "collapsed row keeps rollup");
+        let collapsed_descendants = collapsed[0]
+            .descendant_rollup
+            .as_ref()
+            .expect("descendant_rollup present when collapsed");
+        assert_eq!(collapsed_descendants.total, 4);
+        let working = |rollup: &Rollup| {
+            rollup
+                .counts
+                .iter()
+                .find(|(status, _)| *status == AgentStatus::Working)
+                .map(|(_, n)| *n)
+                .unwrap_or(0)
+        };
+        assert_eq!(working(collapsed_descendants), 2);
+
+        let expanded = build_rows(&agents, &root_order, &set(&["p"]), false);
+        assert!(expanded[0].expanded);
+        assert!(
+            expanded[0].rollup.is_none(),
+            "expanded row has no collapsed-only rollup"
+        );
+        let expanded_descendants = expanded[0]
+            .descendant_rollup
+            .as_ref()
+            .expect("descendant_rollup present even when expanded");
+        assert_eq!(expanded_descendants.total, 4);
+        assert_eq!(working(expanded_descendants), 2);
     }
 
     #[test]
